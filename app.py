@@ -129,6 +129,10 @@ if "filtered_df" in st.session_state:
     st.divider()
     st.header("Step 2 — Configure API Query & Fetch Data")
 
+    all_metrics = st.session_state.filtered_df["Metric"].tolist()
+    selected_metrics = st.multiselect("Select Metrics to Fetch", all_metrics, default=all_metrics)
+    st.session_state.selected_metrics = selected_metrics
+
     col1, col2 = st.columns([1, 1])
 
     with col1:
@@ -149,10 +153,24 @@ if "filtered_df" in st.session_state:
         
     if st.button("Fetch Data from Canary API"):
         start_fetch_time = py_time.perf_counter()
+
+        if not st.session_state.selected_metrics:
+            st.warning("No metrics selected. Please select at least one metric to fetch.")
+            st.stop()
+
+        # Filter the DataFrame based on selected metrics
+        active_df = st.session_state.filtered_df[
+            st.session_state.filtered_df["Metric"].isin(st.session_state.selected_metrics)
+        ]
+        st.session_state.active_df = active_df
+
+        tags = active_df["Canary Point Name"].astype(str).tolist()
+
+        # --- New: Exclude "Not Found" tags from the query ---
+        tags = [tag for tag in tags if tag != "Not Found"]
         
-        tags = st.session_state.filtered_df["Canary Point Name"].astype(str).tolist()
         if not tags:
-            st.error("No tags to query.")
+            st.error("No valid tags to query for the selected metrics.")
             st.stop()
 
         try:
@@ -251,10 +269,10 @@ if "filtered_df" in st.session_state:
             }
             for tag in tags:
                 meta_data[tag] = [
-                    st.session_state.filtered_df.loc[st.session_state.filtered_df["Canary Point Name"] == tag, "Canary Description"].iloc[0],
-                    st.session_state.filtered_df.loc[st.session_state.filtered_df["Canary Point Name"] == tag, "Metric"].iloc[0],
-                    st.session_state.filtered_df.loc[st.session_state.filtered_df["Canary Point Name"] == tag, "DCS Description"].iloc[0],
-                    st.session_state.filtered_df.loc[st.session_state.filtered_df["Canary Point Name"] == tag, "Unit"].iloc[0],
+                    st.session_state.active_df.loc[st.session_state.active_df["Canary Point Name"] == tag, "Canary Description"].iloc[0],
+                    st.session_state.active_df.loc[st.session_state.active_df["Canary Point Name"] == tag, "Metric"].iloc[0],
+                    st.session_state.active_df.loc[st.session_state.active_df["Canary Point Name"] == tag, "DCS Description"].iloc[0],
+                    st.session_state.active_df.loc[st.session_state.active_df["Canary Point Name"] == tag, "Unit"].iloc[0],
                 ]
             meta_df = pd.DataFrame(meta_data)
             
@@ -294,10 +312,10 @@ if "df_hist" in st.session_state and st.session_state.df_hist is not None:
         st.info("Statistics are calculated on the raw data, after attempting to convert values to numbers.")
 
         # Create a mapping from Canary Point Name (tag) to Metric for user-friendly headers
-        filtered_df = st.session_state.filtered_df
+        active_df = st.session_state.active_df
         tag_to_metric_map = pd.Series(
-            filtered_df.Metric.values,
-            index=filtered_df["Canary Point Name"]
+            active_df.Metric.values,
+            index=active_df["Canary Point Name"]
         ).to_dict()
 
         # Isolate the data portion of the dataframe
@@ -332,16 +350,16 @@ if "df_hist" in st.session_state and st.session_state.df_hist is not None:
 
     if st.button("Generate Data Plots"):
         # Mappings for tags, metrics, and units
-        filtered_df = st.session_state.filtered_df
+        active_df = st.session_state.active_df
         tag_to_metric_map = pd.Series(
-            filtered_df.Metric.values,
-            index=filtered_df["Canary Point Name"]
+            active_df.Metric.values,
+            index=active_df["Canary Point Name"]
         ).to_dict()
         metric_to_tag_map = {v: k for k, v in tag_to_metric_map.items()}
         # Create the new map for Metrics to Units
         metric_to_unit_map = pd.Series(
-            filtered_df.Unit.values,
-            index=filtered_df.Metric
+            active_df.Unit.values,
+            index=active_df.Metric
         ).to_dict()
 
         # Get available tags from the data and map them to metric names
@@ -373,7 +391,7 @@ if "df_hist" in st.session_state and st.session_state.df_hist is not None:
                 axes[i].grid(True)
                 axes[i].set_xlabel("DATETIME")
                 # Look up the unit for the current metric and set the Y-axis label
-                unit = filtered_df.loc[filtered_df["Metric"] == metric_name, "Unit"].iloc[0]
+                unit = active_df.loc[active_df["Metric"] == metric_name, "Unit"].iloc[0]
                 axes[i].set_ylabel(unit)
 
             plt.tight_layout()
