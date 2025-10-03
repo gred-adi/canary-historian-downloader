@@ -10,9 +10,111 @@ import shutil
 import os
 import random
 import time as py_time
+import io
+import re
+import tkinter as tk
+from tkinter import filedialog
+
 
 st.set_page_config(page_title="Canary Historian Downloader", layout="wide")
 st.title("Canary Historian Data Downloader")
+
+
+# --- TDT Consolidation Functions ---
+def _process_survey_sheets(file_path, survey_data_list):
+    """
+    Processes the 'Point Survey' and related sheets from a single TDT Excel file.
+    """
+    try:
+        xls = pd.ExcelFile(file_path)
+        if 'Point Survey' not in xls.sheet_names:
+            st.warning(f"'Point Survey' sheet not found in {os.path.basename(file_path)}")
+            return
+
+        df_version = pd.read_excel(xls, 'Version', header=None, nrows=5)
+        tdt_name = str(df_version.iloc[4, 3])
+        df_point_survey = pd.read_excel(xls, 'Point Survey', header=None)
+
+        df_attribute = pd.DataFrame()
+        if 'Attribute' in xls.sheet_names:
+            df_attribute = pd.read_excel(xls, 'Attribute', header=None).iloc[3:, [1, 4, 5, 6, 7]]
+            df_attribute.columns = ['Metric', 'Function', 'Constraint', 'Filter Condition', 'Filter Value']
+
+        df_calculation = pd.DataFrame()
+        if 'Calculation' in xls.sheet_names:
+            df_calculation = pd.read_excel(xls, 'Calculation', header=None).iloc[2:, [1, 2, 3, 5, 6, 7, 8]]
+            df_calculation.columns = ['Metric', 'Calc Point Type', 'Calculation Description', 'Pseudo Code', 'Language', 'Input Point', 'PRiSM Code']
+
+        start_col = 3
+        while start_col < df_point_survey.shape[1]:
+            end_col = start_col + 5
+            model_name = str(df_point_survey.iloc[0, start_col])
+            if pd.notna(model_name) and model_name.strip() != "":
+                headers = list(df_point_survey.iloc[1, 1:3].values) + list(df_point_survey.iloc[1, start_col:end_col].values)
+                sub_data = pd.concat([df_point_survey.iloc[2:, 1:3], df_point_survey.iloc[2:, start_col:end_col]], axis=1)
+                sub_data = sub_data.dropna(subset=sub_data.columns[-5:], how='all')
+
+                if not sub_data.empty:
+                    sub_table_df = pd.DataFrame(sub_data.values, columns=headers)
+                    sub_table_df['TDT'] = tdt_name
+                    sub_table_df['Model'] = model_name
+
+                    if not df_attribute.empty:
+                        sub_table_df = sub_table_df.merge(df_attribute, how='inner', on='Metric')
+                    if not df_calculation.empty:
+                        sub_table_df = sub_table_df.merge(df_calculation, how='left', on='Metric')
+
+                    survey_data_list.append(sub_table_df)
+            start_col = end_col
+    except Exception as e:
+        st.error(f"Failed to process file {os.path.basename(file_path)}: {e}")
+
+@st.cache_data
+def generate_survey_df_from_folder(folder_path):
+    """
+    Scans a folder for TDT Excel files and consolidates them into a single DataFrame.
+    """
+    if not folder_path or not os.path.isdir(folder_path):
+        st.error("Invalid folder path provided.")
+        return None
+
+    tdt_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith('.xlsx') and not f.startswith('~')]
+    if not tdt_files:
+        raise FileNotFoundError(f"No Excel files (.xlsx) found in the folder: {folder_path}")
+
+    all_survey_data = []
+    progress_bar = st.progress(0)
+    for i, file_path in enumerate(tdt_files):
+        _process_survey_sheets(file_path, all_survey_data)
+        progress_bar.progress((i + 1) / len(tdt_files))
+    progress_bar.empty()
+
+    if not all_survey_data:
+        raise ValueError("No valid survey data could be consolidated from the provided files.")
+
+    survey_df = pd.concat(all_survey_data, ignore_index=True)
+    survey_cols = ['TDT', 'Model'] + [col for col in survey_df.columns if col not in ['TDT', 'Model']]
+    survey_df = survey_df[survey_cols]
+    return survey_df
+
+def convert_df_to_excel_bytes(survey_df):
+    """
+    Converts the survey DataFrame into an in-memory Excel file.
+    """
+    output_survey = io.BytesIO()
+    with pd.ExcelWriter(output_survey, engine='xlsxwriter') as writer:
+        survey_df.to_excel(writer, sheet_name='Consolidated Point Survey', index=False)
+    output_survey.seek(0)
+    return output_survey
+
+def select_folder():
+    """Opens a folder selection dialog and returns the path."""
+    root = tk.Tk()
+    root.withdraw()  # Hide the main window
+    root.attributes("-topmost", True)  # Bring the dialog to the front
+    folder_path = filedialog.askdirectory(master=root)
+    root.destroy()
+    return folder_path
 
 # --- Constants & Helpers ---
 # Replace with your actual API details or use Streamlit secrets
@@ -67,20 +169,69 @@ def calculate_time_chunks(start_dt, end_dt, interval_str, num_tags):
     
     return chunks
 
-# --- Step 1: Upload & Filter ---
-st.header("Step 1 — Upload Consolidated Point Survey (Excel)")
-uploaded = st.file_uploader("Upload Excel (.xlsx) containing 'Consolidated Point Survey' sheet", type=["xlsx"])
+# --- Step 1: Select Data Source ---
+st.header("Step 1 — Select Data Source")
 
-if uploaded:
+# --- Option 1: Generate from TDT Folder ---
+st.subheader("Option 1: Generate Consolidated File from TDT Folder")
+if 'folder_path' not in st.session_state:
+    st.session_state.folder_path = ""
+
+if st.button("Select Folder with TDT Files"):
+    st.session_state.folder_path = select_folder()
+
+if st.session_state.folder_path:
+    st.text_input("Selected Folder:", st.session_state.folder_path, disabled=True)
+    if st.button("Generate & Load File"):
+        try:
+            with st.spinner("Processing files..."):
+                survey_df = generate_survey_df_from_folder(st.session_state.folder_path)
+            if survey_df is not None:
+                st.session_state.generated_df = survey_df
+                st.success("TDT files consolidated successfully!")
+                st.dataframe(survey_df.head())
+
+                excel_bytes = convert_df_to_excel_bytes(survey_df)
+                st.download_button(
+                    label="Download Consolidated Excel",
+                    data=excel_bytes,
+                    file_name="Consolidated_Point_Survey.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+        except (FileNotFoundError, ValueError) as e:
+            st.error(e)
+        except Exception as e:
+            st.error(f"An unexpected error occurred: {e}")
+
+# --- Option 2: Upload Pre-made Consolidated File ---
+st.subheader("Option 2: Upload Pre-made Consolidated File")
+uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"], help="Upload a pre-consolidated file if you are not generating one from a folder.")
+
+# --- Main Logic: Determine which dataframe to use ---
+df_survey = None
+data_source_selected = False
+
+if 'generated_df' in st.session_state:
+    st.info("Using the generated data. To use a different file, please refresh the page.")
+    df_survey = st.session_state.generated_df
+    data_source_selected = True
+elif uploaded:
+    st.info("Using the uploaded file.")
     try:
         df_survey = pd.read_excel(uploaded, sheet_name="Consolidated Point Survey")
         if "Canary Point Name" in df_survey.columns:
             df_survey = df_survey[df_survey["Canary Point Name"] != "PRiSM Calc"]
         else:
             df_survey = df_survey
+        data_source_selected = True
     except Exception as e:
         st.error(f"Could not read sheet 'Consolidated Point Survey': {e}")
         st.stop()
+
+# --- Step 2: Filter & Load Metrics ---
+if data_source_selected and df_survey is not None:
+    st.divider()
+    st.header("Step 2 — Filter & Load Metrics")
 
     required_cols = ["TDT", "Model", "Metric", "Canary Point Name", "Canary Description", "DCS Description", "Unit"]
     missing = [c for c in required_cols if c not in df_survey.columns]
@@ -124,10 +275,10 @@ if uploaded:
                 f"These will be excluded from the download. \n\n**Metrics:** {metrics_str}"
             )
 
-# --- Step 2: Configure & Fetch ---
+# --- Step 3: Configure & Fetch ---
 if "filtered_df" in st.session_state:
     st.divider()
-    st.header("Step 2 — Configure API Query & Fetch Data")
+    st.header("Step 3 — Configure API Query & Fetch Data")
 
     all_metrics = st.session_state.filtered_df["Metric"].tolist()
     selected_metrics = st.multiselect("Select Metrics to Fetch", all_metrics, default=all_metrics)
